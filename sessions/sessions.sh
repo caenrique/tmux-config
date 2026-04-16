@@ -34,6 +34,7 @@ _RESET=$'\033[0m'
 # Format: type<TAB>key<TAB>display
 #   s <TAB> stripped_id <TAB> <green>session_name<reset>    ← running session
 #   p <TAB> path        <TAB> display_name                  ← project w/o session
+#   n <TAB>             <TAB> display_name                  ← new-session sentinel
 #
 # Both sections are sorted by recency score (highest first).
 # Projects already open as sessions are skipped to avoid duplicates.
@@ -53,7 +54,7 @@ build_entries() {
     local prev_id
     prev_id=$(get_session_id "$prev_session")
     if [[ -n "$prev_id" ]]; then
-      printf "s\t%s\t%s%s%s\n" "${prev_id#\$}" "$_GREEN" "$prev_session" "$_RESET"
+      printf "s\t%s\t%s%s %s%s\n" "${prev_id#\$}" "$_GREEN" "$_ICON_SESSION" "$prev_session" "$_RESET"
     fi
   fi
 
@@ -67,7 +68,7 @@ build_entries() {
       done \
     | sort_by_score "$pane_path" \
     | while IFS=$'\t' read -r name raw_id _path; do
-        printf "s\t%s\t%s%s%s\n" "$raw_id" "$_GREEN" "$name" "$_RESET"
+        printf "s\t%s\t%s%s %s%s\n" "$raw_id" "$_GREEN" "$_ICON_SESSION" "$name" "$_RESET"
       done
 
   # Projects: field 3 = project path (same as field 2) for the prefix boost.
@@ -80,8 +81,11 @@ build_entries() {
       done \
     | sort_by_score "$pane_path" \
     | while IFS=$'\t' read -r name path _; do
-        printf "p\t%s\t%s\n" "$path" "$name"
+        printf "p\t%s\t%s %s\n" "$path" "$_ICON_PROJECT" "$name"
       done
+
+  # New-session sentinel — always last.
+  printf "n\t\t%s new session\n" "$_ICON_NEW"
 }
 
 # ── Action functions ──────────────────────────────────────────────────────────
@@ -113,27 +117,32 @@ _action_ctrl_x() {
   local tmux_id="\$$id"
   local sess_path
   sess_path=$(tmux display-message -p -t "$tmux_id" '#{session_path}' 2>/dev/null)
-  local current_display
-  current_display=$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)
   local clean_name
-  clean_name=$(printf '%s' "$current_display" | sed $'s/\033\\[[0-9;]*m//g')
+  clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
+  clean_name="${clean_name#${_ICON_SESSION} }"
   tmux kill-session -t "$tmux_id" 2>/dev/null
-  awk -F'\t' -v OFS='\t' -v id="$id" -v path="$sess_path" -v name="$clean_name" \
-      '$1=="s" && $2==id { $1="p"; $2=path; $3=name } { print }' \
-      "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
+  # Remove the session row from its current position and insert it as a project
+  # row just before the new-session sentinel so it lands in the projects section.
+  NEW_NAME="${_ICON_PROJECT} ${clean_name}" \
+    awk -F'\t' -v OFS='\t' -v id="$id" -v path="$sess_path" '
+      $1=="s" && $2==id { saved = "p\t" path "\t" ENVIRON["NEW_NAME"]; next }
+      $1=="n" { if (saved != "") { print saved; saved = "" } }
+      { print }
+      END { if (saved != "") print saved }
+    ' "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
 }
 
-# ctrl-r: rename session via a nested fzf prompt; update display in place.
+# ctrl-r: rename session via an inline fzf prompt; update display in place.
+# Called via fzf execute (not execute-silent) so it has terminal access.
 _action_ctrl_r() {
   local type="$1" id="$2" tmpfile="$3"
   [[ "$type" != "s" ]] && return
   local tmux_id="\$$id"
-  local current_display
-  current_display=$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)
   local clean_name
-  clean_name=$(printf '%s' "$current_display" | sed $'s/\033\\[[0-9;]*m//g')
+  clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
+  clean_name="${clean_name#${_ICON_SESSION} }"
   local rename_output rename_rc rename_key new_name
-  rename_output=$(echo "" | fzf $FZF_POPUP \
+  rename_output=$(echo "" | fzf $FZF_INLINE \
     --print-query --no-select-1 \
     --query "$clean_name" \
     --prompt "Rename to: " \
@@ -143,18 +152,20 @@ _action_ctrl_r() {
   [[ $rename_rc -eq 130 ]] && return
   rename_key=$(printf '%s' "$rename_output" | sed -n '2p')
   [[ "$rename_key" == "ctrl-bs" ]] && return
-  new_name=$(printf '%s' "$rename_output" | head -1)
-  new_name=$(printf '%s' "$new_name" \
-    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]]/-/g')
+  new_name=$(sanitize_name "$(printf '%s' "$rename_output" | head -1)")
   [[ -z "$new_name" || "$new_name" == "$clean_name" ]] && return
   tmux rename-session -t "$tmux_id" "$new_name"
-  local new_display="${_GREEN}${new_name}${_RESET}"
+  local new_display="${_GREEN}${_ICON_SESSION} ${new_name}${_RESET}"
   NEW_DISPLAY="$new_display" awk -F'\t' -v OFS='\t' -v id="$id" \
       '$1=="s" && $2==id { $3=ENVIRON["NEW_DISPLAY"] } { print }' \
       "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
 }
 
 manage_sessions() {
+  # Build the list once and write it to a tmpfile.  Mutating actions (ctrl-d,
+  # ctrl-x, ctrl-r) call back into this script via --action, modify the tmpfile,
+  # then trigger fzf's reload so the popup stays open without flickering.
+  # The while loop only iterates when ctrl-w is cancelled (ctrl-bs in pick_branch).
   local tmpfile
   tmpfile=$(mktemp)
   trap "rm -f '$tmpfile' '${tmpfile}.new'" EXIT
@@ -172,14 +183,15 @@ manage_sessions() {
           --delimiter $'\t' \
           --prompt "Sessions > " \
           --expect "ctrl-w,ctrl-bs" \
-          --header "enter:open  ctrl-w:worktree  ctrl-d:wt+kill  ctrl-x:kill  ctrl-r:rename  ctrl-bs:back" \
+          --header "enter:open  ctrl-w:worktree  ctrl-d:wt+kill  ctrl-x:kill  ctrl-r:rename  ?:preview  ctrl-bs:back" \
           --preview "[ '{1}' = s ] \
                      && tmux capture-pane -e -p -t '\$'{2} 2>/dev/null \
                      || ls '{2}' 2>/dev/null" \
-          --preview-window "up:50%:border-bottom:nofollow:nohidden" \
+          --preview-window "down:50%:border-top:nofollow:hidden" \
+          --bind "?:toggle-preview" \
           --bind "ctrl-d:execute-silent('$self' --action ctrl-d {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})" \
           --bind "ctrl-x:execute-silent('$self' --action ctrl-x {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})" \
-          --bind "ctrl-r:execute-silent('$self' --action ctrl-r {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})"
+          --bind "ctrl-r:execute('$self' --action ctrl-r {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})"
     )
     fzf_rc=$?
 
@@ -226,11 +238,32 @@ manage_sessions() {
         fi
       fi
       continue
+    fi
+
+    # ── New session sentinel: Enter ───────────────────────────────────────────
+    if [[ "$type" == "n" ]]; then
+      local name_output name_key new_name
+      name_output=$(echo "" | fzf $FZF_POPUP \
+        --print-query --no-select-1 \
+        --prompt "Session name: " \
+        --header "enter:create  ctrl-bs:cancel" \
+        --expect "ctrl-bs")
+      local name_rc=$?
+      [[ $name_rc -eq 130 ]] && continue
+      name_key=$(printf '%s' "$name_output" | sed -n '2p')
+      [[ "$name_key" == "ctrl-bs" ]] && continue
+      new_name=$(sanitize_name "$(printf '%s' "$name_output" | head -1)")
+      [[ -z "$new_name" ]] && continue
+      update_score "$new_name"
+      switch_or_create_session "$HOME" "$new_name"
+      return 0
+    fi
 
     # ── Project row: Enter ────────────────────────────────────────────────────
-    elif [[ "$type" == "p" ]]; then
-      update_score "$display"
-      switch_or_create_session "$key2" "$display"
+    if [[ "$type" == "p" ]]; then
+      local clean_display="${display#${_ICON_PROJECT} }"
+      update_score "$clean_display"
+      switch_or_create_session "$key2" "$clean_display"
       return 0
 
     # ── Session row: Enter ────────────────────────────────────────────────────
@@ -243,6 +276,9 @@ manage_sessions() {
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+# Normal invocation (C-S-s): run manage_sessions.
+# Action invocation (fzf execute-silent binding): run the named mutation on the
+# tmpfile and exit.  manage_sessions is never called in this path.
 if [[ "$1" == --action ]]; then
   case "$2" in
     ctrl-d) _action_ctrl_d "${@:3}" ;;

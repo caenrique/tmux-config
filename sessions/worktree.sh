@@ -97,21 +97,18 @@ rename_worktree() {
     return 1
   fi
 
-  # Pre-fill the query with the current branch name so the user can edit it.
   local rename_output rename_rc rename_key new_name
-  rename_output=$(echo "" | fzf $FZF_POPUP \
+  rename_output=$(echo "" | fzf $FZF_INLINE \
     --print-query --no-select-1 \
     --query "$old_branch" \
     --prompt "Rename to: " \
-    --header "enter:rename  ctrl-bs:back" \
+    --header "enter:rename  ctrl-bs:cancel" \
     --expect "ctrl-bs")
   rename_rc=$?
-  [[ $rename_rc -eq 130 ]] && return 2                      # Esc → close all
+  [[ $rename_rc -eq 130 ]] && return 1
   rename_key=$(printf '%s' "$rename_output" | sed -n '2p')
-  [[ "$rename_key" == "ctrl-bs" ]] && return 1              # ctrl-bs → back
-  new_name=$(printf '%s' "$rename_output" | head -1)
-  new_name=$(printf '%s' "$new_name" \
-    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]]/-/g')
+  [[ "$rename_key" == "ctrl-bs" ]] && return 1
+  new_name=$(sanitize_name "$(printf '%s' "$rename_output" | head -1)")
   [[ -z "$new_name" || "$new_name" == "$old_branch" ]] && return 1
 
   local new_dir new_wt_path
@@ -135,44 +132,70 @@ rename_worktree() {
   # Repair the worktree linkage from inside the moved directory.
   git -C "$new_wt_path" worktree repair >&2
 
-  # Tear down the old session (if any) and open a new one at the new path.
-  local old_session_id
+  # Kill the old session (if any).
+  # Switch to the renamed path only when the current pane is inside the
+  # worktree being renamed; otherwise leave the user where they are.
+  local old_session_id pane_root
   old_session_id=$(get_session_id "$(format_session_name "$wt_path")")
-  [[ -n "$old_session_id" ]] && tmux kill-session -t "$old_session_id"
+  [[ -n "$old_session_id" ]] && tmux kill-session -t "$old_session_id" 2>/dev/null
 
-  switch_or_create_session "$new_wt_path"
+  pane_root=$(git -C "$(tmux display-message -p '#{pane_current_path}')" \
+    rev-parse --show-toplevel 2>/dev/null)
+  [[ "$pane_root" == "$wt_path" ]] && switch_or_create_session "$new_wt_path"
+}
+
+# Emit the full worktree list consumed by fzf: two sentinel rows followed by
+# one entry per worktree.  Called via --list for fzf reload bindings.
+_list_entries() {
+  local repo_path="$1"
+  printf "switch\t%s switch project\n" "$_ICON_SWITCH"
+  printf "\t%s new worktree\n" "$_ICON_NEW"
+  list_worktrees "$repo_path" | while IFS=$'\t' read -r wt_path branch; do
+    printf "%s\t%s %s [%s]\n" "$wt_path" "$_ICON_BRANCH" "$(basename "$wt_path")" "$branch"
+  done
+}
+
+# ctrl-d: delete the worktree and kill its tmux session.
+_action_ctrl_d() {
+  local repo_path="$1" wt_path="$2"
+  [[ -z "$wt_path" || "$wt_path" == "switch" ]] && return
+  delete_worktree "$repo_path" "$wt_path"
+}
+
+# ctrl-r: rename worktree via an inline fzf prompt; reload stays in place.
+# Called via fzf execute (not execute-silent) so it has terminal access.
+_action_ctrl_r() {
+  local repo_path="$1" wt_path="$2"
+  [[ -z "$wt_path" || "$wt_path" == "switch" ]] && return
+  local container
+  container=$(dirname "$repo_path")
+  rename_worktree "$repo_path" "$container" "$wt_path"
 }
 
 # Show the worktree manager for a project.
-# Displays an fzf list of all worktrees with the following key bindings:
-#   Enter   — switch to (or create) a tmux session for the selected worktree
-#   Ctrl-D  — delete the worktree and its tmux session; list stays open
-#   Ctrl-R  — rename the branch, directory, and session; list stays open
-#   (top)   — "[+ new worktree]" opens the branch picker to add a worktree
+#   Enter    — switch to (or create) a tmux session for the selected worktree
+#   Ctrl-D   — delete worktree + session; picker stays open via reload
+#   Ctrl-R   — rename worktree; picker stays open via reload
+#   Ctrl-BS  — go back to the project picker
+#   sentinels — switch project / new worktree handled in the main loop
 manage_worktrees() {
   local repo_path="$1"
-  local container
+  local container self
   container=$(dirname "$repo_path")
+  self="${BASH_SOURCE[0]}"
 
   while true; do
-    # Rebuild the display list on every iteration so deleted entries disappear.
-    local wt_entries
-    wt_entries=$(list_worktrees "$repo_path" | awk -F'\t' '{
-      n = split($1, a, "/")
-      print $1 "\t" a[n] " [" $2 "]"
-    }')
-
     local output fzf_rc
     output=$(
-      { printf "switch\t[+ switch project]\n"
-        printf "\t[+ new worktree]\n"
-        printf '%s\n' "$wt_entries"; } \
+      "$self" --list "$repo_path" \
       | fzf $FZF_POPUP \
           --with-nth 2 \
           --delimiter $'\t' \
           --prompt "Worktrees > " \
-          --expect "ctrl-d,ctrl-r,ctrl-bs" \
-          --header "enter:switch  ctrl-d:delete  ctrl-r:rename  ctrl-bs:back"
+          --expect "ctrl-bs" \
+          --header "enter:switch  ctrl-d:delete  ctrl-r:rename  ctrl-bs:back" \
+          --bind "ctrl-d:execute-silent('$self' --action ctrl-d '$repo_path' {1})+reload('$self' --list '$repo_path')+pos({n})" \
+          --bind "ctrl-r:execute('$self' --action ctrl-r '$repo_path' {1})+reload('$self' --list '$repo_path')+pos({n})"
     )
     fzf_rc=$?
 
@@ -187,15 +210,13 @@ manage_worktrees() {
     [[ "$key" == "ctrl-bs" ]] && return 1  # ctrl-bs → back to project picker
 
     if [[ "$wt_path" == "switch" ]]; then
-      if [[ -z "$key" ]]; then
-        local new_repo pick_rc
-        new_repo=$(pick_project)
-        pick_rc=$?
-        [[ $pick_rc -eq 2 ]] && return 0   # Esc in project picker → close all
-        if [[ $pick_rc -eq 0 ]]; then
-          repo_path="$new_repo"
-          container=$(dirname "$repo_path")
-        fi
+      local new_repo pick_rc
+      new_repo=$(pick_project)
+      pick_rc=$?
+      [[ $pick_rc -eq 2 ]] && return 0   # Esc in project picker → close all
+      if [[ $pick_rc -eq 0 ]]; then
+        repo_path="$new_repo"
+        container=$(dirname "$repo_path")
       fi
 
     elif [[ -z "$wt_path" ]]; then
@@ -214,13 +235,6 @@ manage_worktrees() {
       switch_or_create_session "$worktree_path"
       return 0
 
-    elif [[ "$key" == "ctrl-d" ]]; then
-      delete_worktree "$repo_path" "$wt_path"
-
-    elif [[ "$key" == "ctrl-r" ]]; then
-      rename_worktree "$repo_path" "$container" "$wt_path"
-      [[ $? -eq 2 ]] && return 0  # Esc in rename prompt → close all
-
     else
       switch_or_create_session "$wt_path"
       return 0
@@ -228,7 +242,23 @@ manage_worktrees() {
   done
 }
 
-# Main ─────────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
+# --list <repo_path>  : emit the worktree list (called by fzf reload bindings)
+# --action <name> ... : run a mutation    (called by fzf execute-silent bindings)
+# Normal invocation (C-S-w): run manage_worktrees.
+if [[ "$1" == --list ]]; then
+  _list_entries "$2"
+  exit
+fi
+
+if [[ "$1" == --action ]]; then
+  case "$2" in
+    ctrl-d) _action_ctrl_d "$3" "$4" ;;
+    ctrl-r) _action_ctrl_r "$3" "$4" ;;
+  esac
+  exit
+fi
+
 repo_path=$(get_current_project)
 
 while true; do

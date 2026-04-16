@@ -13,11 +13,30 @@ export FZF_DEFAULT_OPTS="\
 --color=selected-bg:#45475A \
 --color=border:#6C7086,label:#CDD6F4"
 
-# Shared fzf flags: bottom-anchored tmux popup, 50% height, minimal chrome.
-FZF_POPUP="--tmux center,100%,100% --reverse --no-scrollbar --no-info --no-separator --no-border"
+# Shared fzf style flags (no --tmux; used for inline prompts inside execute).
+FZF_INLINE="--reverse --no-scrollbar --no-info --no-separator --no-border"
+# Full-height tmux popup with the same chrome.
+FZF_POPUP="--tmux bottom,100%,100% $FZF_INLINE"
+
+# Emoji icons used across picker lists.
+_ICON_SESSION="⚡"   # running session
+_ICON_PROJECT="📂"   # unopen project
+_ICON_BRANCH="🌱"    # local branch / worktree
+_ICON_REMOTE="📡"    # remote-only branch
+_ICON_NEW="✨"        # new action sentinels
+_ICON_SWITCH="🔁"    # switch project sentinel
 
 # TSV file storing per-session pick scores for recency ranking.
 SCORE_FILE="$HOME/.local/share/tmux-sessions/scores.tsv"
+
+# ── String utilities ──────────────────────────────────────────────────────────
+
+# Strip ANSI colour escape sequences from a string.
+strip_ansi() { printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
+
+# Trim leading/trailing whitespace and replace internal spaces with dashes.
+# Used to normalise user-entered branch and session names.
+sanitize_name() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]]/-/g'; }
 
 # Derive a short tmux session name from a filesystem path.
 #
@@ -315,22 +334,34 @@ pick_branch() {
 
   while true; do
     local selected rc
-    selected=$({ echo "[+ new branch]"; list_branches "$repo_path"; } \
-      | fzf $FZF_POPUP \
+    selected=$(
+      {
+        printf "[new]\t%s new branch\n" "$_ICON_NEW"
+        list_branches "$repo_path" | while IFS= read -r branch; do
+          if [[ "$branch" == origin/* ]]; then
+            printf "%s\t%s %s\n" "$branch" "$_ICON_REMOTE" "$branch"
+          else
+            printf "%s\t%s %s\n" "$branch" "$_ICON_BRANCH" "$branch"
+          fi
+        done
+      } | fzf $FZF_POPUP \
+          --with-nth 2 \
+          --delimiter $'\t' \
           --prompt "Branch > " \
           --header "enter:checkout  ctrl-bs:back" \
-          --expect "ctrl-bs")
+          --expect "ctrl-bs"
+    )
     rc=$?
     [[ $rc -eq 130 ]] && return 2
     [[ -z "$selected" ]] && return 2
 
     local key item
     key=$(printf '%s' "$selected" | head -1)
-    item=$(printf '%s' "$selected" | sed -n '2p')
+    item=$(printf '%s' "$selected" | sed -n '2p' | cut -f1)
     [[ "$key" == "ctrl-bs" ]] && return 1
     [[ -z "$item" ]] && return 2
 
-    if [[ "$item" == "[+ new branch]" ]]; then
+    if [[ "$item" == "[new]" ]]; then
       local name_output name_rc name_key new_name
       name_output=$(echo "" | fzf $FZF_POPUP \
         --print-query --no-select-1 \
@@ -341,9 +372,7 @@ pick_branch() {
       [[ $name_rc -eq 130 ]] && return 2
       name_key=$(printf '%s' "$name_output" | sed -n '2p')
       [[ "$name_key" == "ctrl-bs" ]] && continue
-      new_name=$(printf '%s' "$name_output" | head -1)
-      new_name=$(printf '%s' "$new_name" \
-        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]]/-/g')
+      new_name=$(sanitize_name "$(printf '%s' "$name_output" | head -1)")
       [[ -z "$new_name" ]] && continue
       echo "new:${new_name}"
       return 0
