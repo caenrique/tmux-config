@@ -54,17 +54,28 @@ build_entries() {
     local prev_id
     prev_id=$(get_session_id "$prev_session")
     if [[ -n "$prev_id" ]]; then
-      printf "s\t%s\t%s%s %s%s\n" "${prev_id#\$}" "$_GREEN" "$_ICON_SESSION" "$prev_session" "$_RESET"
+      local prev_path prev_display
+      prev_path=$(tmux display-message -p -t "$prev_id" '#{session_path}' 2>/dev/null)
+      prev_display=$(format_session_name "$prev_path")
+      # Only use the path-derived name when it maps back to the stored name
+      # (dots→underscores). For manually-named sessions it won't match, so fall back.
+      [[ "${prev_display//./_}" != "$prev_session" ]] && prev_display="$prev_session"
+      printf "s\t%s\t%s%s %s%s\n" "${prev_id#\$}" "$_GREEN" "$_ICON_SESSION" "$prev_display" "$_RESET"
     fi
   fi
 
   # Sessions: field 3 = session working dir, used by sort_by_score for the
   # path-prefix boost (longer shared prefix with pane_path → higher rank).
+  # Use format_session_name on the session path to restore dots that tmux
+  # silently converted to underscores in the stored session name.  Fall back
+  # to the stored name for manually-named sessions whose path doesn't round-trip.
   tmux ls -F "#{session_id}"$'\t'"#{session_name}"$'\t'"#{session_path}" 2>/dev/null \
     | sed 's/^\$//' \
     | while IFS=$'\t' read -r raw_id name sess_path; do
         [[ "$name" == "$prev_session" ]] && continue
-        printf "%s\t%s\t%s\n" "$name" "$raw_id" "$sess_path"
+        derived=$(format_session_name "$sess_path")
+        [[ "${derived//./_}" != "$name" ]] && derived="$name"
+        printf "%s\t%s\t%s\n" "$derived" "$raw_id" "$sess_path"
       done \
     | sort_by_score "$pane_path" \
     | while IFS=$'\t' read -r name raw_id _path; do
@@ -362,6 +373,16 @@ if [[ "$1" == --action ]]; then
     ctrl-x) _action_ctrl_x "${@:3}" ;;
     ctrl-r) _action_ctrl_r "${@:3}" ;;
   esac
+  exit
+fi
+
+# --display-name <session_path> <session_name>
+# Used by the tmux status bar to restore dots that tmux converted to underscores.
+# Derives the display name from the session path via format_session_name; falls
+# back to the stored session name when the path doesn't round-trip (manual sessions).
+if [[ "$1" == --display-name ]]; then
+  derived=$(format_session_name "$2")
+  [[ "${derived//./_}" == "$3" ]] && printf '%s' "$derived" || printf '%s' "$3"
   exit
 fi
 
