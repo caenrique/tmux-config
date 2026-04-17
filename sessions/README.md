@@ -12,46 +12,33 @@ Scripts powering the tmux session and worktree picker.
 
 ## Flow diagram
 
-```mermaid
-flowchart TD
-    Start(["C-S-s"]) --> Picker
+```
 
-    subgraph Picker["fzf popup — sessions.sh"]
-        S["⚡ session rows  (green)"]
-        P["📂 project rows"]
-        N["✨ new session sentinel"]
-    end
-
-    S -->|Enter| Switch["tmux switch-client"]
-    P -->|Enter| Open["create session → switch"]
-    N -->|Enter| NewPrompt["name prompt → create session at ~"]
-
-    S & P -->|ctrl-w| BP
-
-    subgraph BP["pick_branch — common.sh"]
-        BList["branch list\n(local + remote-only)"]
-        BList -->|ctrl-f| Fetch["git fetch --all\n(background · spinner · reload)"]
-        Fetch -.->|reload on complete| BList
-    end
-
-    BP -->|"new:‹name›"| AddNew["add_worktree -b ‹name›\n→ switch"]
-    BP -->|"existing:‹branch›"| AddExisting["add_worktree ‹branch›\n→ switch"]
-
-    S -->|ctrl-d| KillS["kill session"]
-    KillS --> WTC1{"linked\nworktree?"}
-    WTC1 -->|yes| RmS["git worktree remove --force"]
-    WTC1 -->|no| Done1((" "))
-
-    P -->|ctrl-d| WTC2{"linked\nworktree?"}
-    WTC2 -->|yes| RmP["git worktree remove --force\n→ remove row"]
-    WTC2 -->|no| Msg1["⚠ not a linked worktree"]
-
-    S -->|ctrl-x| KillOnly["kill session\n→ row becomes 📂 project"]
-
-    S & P -->|ctrl-r| WTC3{"linked\nworktree?"}
-    WTC3 -->|yes| RenWT["rename_worktree\ngit branch -m · mv · worktree repair"]
-    WTC3 -->|"no (session)"| RenS["tmux rename-session"]
-    WTC3 -->|"no (project)"| Msg2["⚠ not a linked worktree"]
+                                  ┌───────────────────────────────────────────────────────────────────┐
+                                  │  Enter ───────▶  ⚡ → switch-client                               │
+                                  │             ──▶  📂 → create session + switch                     │
+                                  │             ──▶  ✨ → name prompt → create at ~                   │
+                                  ├───────────────────────────────────────────────────────────────────┤
+                                  │  ctrl-w ──────▶  ┌─────────────────────────────────────────────┐  │
+                                  │                  │                 pick_branch                 │  │
+                                  │                  │  local branches + remote-only               │  │
+                                  │                  │  ctrl-f ──▶ git fetch --all  ↺ reload       │  │
+           ┌─────────────────┐    │                  └─────────────────────────────────────────────┘  │
+           │   fzf popup     │    │  new:<name>         ──▶ add_worktree -b ──┐                       │
+           │  ─────────────  │    │  existing:<branch>  ──▶ add_worktree ─────┴──▶ switch             │
+C-S-s ───▶ │  ⚡ sessions    │───▶├───────────────────────────────────────────────────────────────────┤
+           │  📂 projects    │    │  ctrl-d ──────▶  ⚡: kill session ──▶ linked WT? ──yes──▶ rm WT   │
+           │  ✨ sentinel    │    │                                                 └──no──▶ done     │
+           └─────────────────┘    │             ──▶  📂: linked WT? ──yes──▶ rm WT                    │
+                                  │                                └──no──▶ ⚠ not a WT                │
+                                  ├───────────────────────────────────────────────────────────────────┤
+                                  │  ctrl-x ──────▶  ⚡: kill only → row becomes 📂                   │
+                                  ├───────────────────────────────────────────────────────────────────┤
+                                  │  ctrl-r ──────▶  linked WT? ──yes──▶ rename_worktree              │
+                                  │                            │       (branch + dir + repair)        │
+                                  │                            ├─ no (⚡) ──▶ tmux rename-session     │
+                                  │                            └─ no (📂) ──▶ ⚠ not a WT              │
+                                  └───────────────────────────────────────────────────────────────────┘
 ```
 
 ---
