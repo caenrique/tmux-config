@@ -92,8 +92,25 @@ build_entries() {
 # Called as: sessions.sh --action <name> <type> <id> <tmpfile>
 # Each is a no-op when type != s (e.g. ctrl-d pressed on a project row).
 
+# Return 0 if path looks like an orphaned worktree directory: its parent
+# contains at least one other directory that is a git repo (.git present).
+# Used to offer a delete prompt when git no longer tracks the worktree.
+_is_orphaned_worktree_dir() {
+  local path="$1"
+  local container
+  container=$(dirname "$path")
+  local sibling
+  for sibling in "$container"/*/; do
+    sibling="${sibling%/}"
+    [[ "$sibling" == "$path" ]] && continue
+    [[ -e "$sibling/.git" ]] && return 0
+  done
+  return 1
+}
+
 # ctrl-d: kill session + remove its worktree if applicable (session rows);
-#         delete a linked worktree with no session (project rows).
+#         delete a linked worktree with no session (project rows);
+#         prompt to delete if dir looks like an orphaned worktree.
 _action_ctrl_d() {
   local type="$1" id="$2" tmpfile="$3"
 
@@ -104,27 +121,39 @@ _action_ctrl_d() {
     tmux kill-session -t "$tmux_id" 2>/dev/null
     local git_dir
     git_dir=$(git -C "$sess_path" rev-parse --git-dir 2>/dev/null)
+    grep -v $'^s\t'"$id"$'\t' "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
     if [[ "$git_dir" == *"worktrees"* ]]; then
       local wt_repo
       wt_repo=$(git -C "$sess_path" rev-parse --show-toplevel 2>/dev/null)
-      [[ -n "$wt_repo" ]] && git -C "$wt_repo" worktree remove --force "$sess_path" >&2
+      [[ -n "$wt_repo" ]] && git -C "$wt_repo" worktree remove --force "$sess_path" >&2 &
     fi
-    grep -v $'^s\t'"$id"$'\t' "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
 
   elif [[ "$type" == "p" ]]; then
     local wt_path="$id"
     local git_dir
     git_dir=$(git -C "$wt_path" rev-parse --git-dir 2>/dev/null)
     if [[ "$git_dir" != *"worktrees"* ]]; then
-      tmux display-message -d 2000 "ctrl-d: not a linked worktree"
+      if _is_orphaned_worktree_dir "$wt_path"; then
+        local answer
+        answer=$(printf 'No\nYes' | fzf $FZF_INLINE \
+          --no-sort \
+          --prompt "Delete $(basename "$wt_path")? " \
+          --header "directory is not git-linked — delete anyway?")
+        [[ "$answer" != "Yes" ]] && return
+        grep -v $'^p\t'"$(printf '%s' "$wt_path" | sed 's|[/\&]|\\&|g')"$'\t' \
+          "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
+        rm -rf "$wt_path" &
+      else
+        tmux display-message -d 2000 "ctrl-d: not a linked worktree"
+      fi
       return
     fi
     local wt_repo
     wt_repo=$(git -C "$wt_path" rev-parse --show-toplevel 2>/dev/null)
     [[ -z "$wt_repo" ]] && return
-    git -C "$wt_repo" worktree remove --force "$wt_path" >&2
     grep -v $'^p\t'"$(printf '%s' "$wt_path" | sed 's|[/\&]|\\&|g')"$'\t' \
       "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
+    git -C "$wt_repo" worktree remove --force "$wt_path" >&2 &
   fi
 }
 
@@ -237,7 +266,7 @@ manage_sessions() {
                      || ls '{2}' 2>/dev/null" \
           --preview-window "down:50%:border-top:nofollow:hidden" \
           --bind "?:toggle-preview" \
-          --bind "ctrl-d:execute-silent('$self' --action ctrl-d {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})" \
+          --bind "ctrl-d:execute('$self' --action ctrl-d {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})" \
           --bind "ctrl-x:execute-silent('$self' --action ctrl-x {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})" \
           --bind "ctrl-r:execute('$self' --action ctrl-r {1} {2} '$tmpfile')+reload(cat '$tmpfile')+pos({n})"
     )
