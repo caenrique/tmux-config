@@ -16,7 +16,7 @@ export FZF_DEFAULT_OPTS="\
 # Shared fzf style flags (no --tmux; used for inline prompts inside execute).
 FZF_INLINE="--reverse --no-scrollbar --no-info --no-separator --no-border"
 # Full-height tmux popup with the same chrome.
-FZF_POPUP="--tmux bottom,100%,100% $FZF_INLINE"
+FZF_POPUP="--tmux bottom,100%,100% --scheme=path $FZF_INLINE"
 
 # Emoji icons used across picker lists.
 _ICON_SESSION="⚡"   # running session
