@@ -4,9 +4,9 @@
 # followed by projects without a session.  All actions are in a single fzf picker.
 #   Enter     — switch to session / open project as new session
 #   Ctrl-W    — open branch picker to create a worktree for the row's repo
-#   Ctrl-D    — kill session + delete worktree (no prompt); list updates in place
+#   Ctrl-D    — kill session + delete worktree; orphaned project dirs prompt to confirm
 #   Ctrl-X    — kill session only; entry becomes a project row
-#   Ctrl-R    — rename session; list updates in place
+#   Ctrl-R    — rename worktree (branch + dir + repair) if linked; session name otherwise
 #   Ctrl-BS   — close picker
 
 source "$(dirname "$0")/common.sh"
@@ -101,7 +101,7 @@ build_entries() {
 
 # ── Action functions ──────────────────────────────────────────────────────────
 # Called as: sessions.sh --action <name> <type> <id> <tmpfile>
-# Each is a no-op when type != s (e.g. ctrl-d pressed on a project row).
+# ctrl-x is a no-op on non-session rows; ctrl-d and ctrl-r handle both s and p.
 
 # Return 0 if path looks like an orphaned worktree directory: its parent
 # contains at least one other directory that is a git repo (.git present).
@@ -289,7 +289,7 @@ manage_sessions() {
     local key line type key2 display
     key=$(printf '%s' "$output" | head -1)
     line=$(printf '%s' "$output" | sed -n '2p')
-    type=$(printf '%s' "$line" | cut -f1)    # s or p
+    type=$(printf '%s' "$line" | cut -f1)    # s, p, or n
     key2=$(printf '%s' "$line" | cut -f2)    # stripped session ID or path
     display=$(printf '%s' "$line" | cut -f3) # display name (may contain ANSI codes)
 
@@ -365,7 +365,7 @@ manage_sessions() {
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 # Normal invocation (C-S-s): run manage_sessions.
-# Action invocation (fzf execute-silent binding): run the named mutation on the
+# Action invocation (fzf execute / execute-silent binding): run the named mutation on the
 # tmpfile and exit.  manage_sessions is never called in this path.
 if [[ "$1" == --action ]]; then
   case "$2" in

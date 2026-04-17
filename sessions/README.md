@@ -22,7 +22,7 @@ Scripts powering the tmux session and worktree picker.
                                   │  ctrl-w ──────▶  ┌─────────────────────────────────────────────┐  │
                                   │                  │                 pick_branch                 │  │
                                   │                  │  local branches + remote-only               │  │
-                                  │                  │  ctrl-f ──▶ git fetch --all  ↺ reload       │  │
+                                  │                  │  ctrl-f ──▶ fetch_reload.sh  ↺ reload       │  │
            ┌─────────────────┐    │                  └─────────────────────────────────────────────┘  │
            │   fzf popup     │    │  new:<name>         ──▶ add_worktree -b ──┐                       │
            │  ─────────────  │    │  existing:<branch>  ──▶ add_worktree ─────┴──▶ switch             │
@@ -56,24 +56,38 @@ Opens a full-screen fzf popup with a unified, ranked list:
 |-----|------------------|------------------|-----------------|
 | `Enter` | Switch to session | Create session and switch | Prompt for name → create session at `~` |
 | `Ctrl-W` | Open branch picker → create/checkout worktree | Same | — |
-| `Ctrl-D` | Kill session + delete linked worktree | Delete linked worktree; ⚠ message if not a worktree | — |
+| `Ctrl-D` | Kill session + delete linked worktree (background, no prompt) | Delete linked worktree; for orphaned dirs (parent has another git repo) shows an fzf confirm prompt; ⚠ message otherwise | — |
 | `Ctrl-X` | Kill session; entry moves to project section | — | — |
 | `Ctrl-R` | Rename worktree (branch+dir) if linked; rename session otherwise | Rename linked worktree; ⚠ message if not a worktree | — |
 | `Ctrl-BS` / `Esc` | Close picker | Close picker | Close picker |
 
-`Ctrl-D`, `Ctrl-X` use `execute-silent + reload` — the popup stays open and the list updates in place. `Ctrl-R` uses `execute + reload` (needs terminal access for the inline rename prompt).
+`Ctrl-X` uses `execute-silent + reload` — runs silently while the popup stays open. `Ctrl-D` and `Ctrl-R` use `execute + reload` (need terminal access: `Ctrl-D` may show an orphaned-dir fzf confirm prompt; `Ctrl-R` shows the inline rename prompt).
 
 ### How in-place actions work
 
 `manage_sessions` writes the initial list to a temp file once at startup. Each mutating binding calls back into `sessions.sh --action <name>` as a subprocess, which modifies the temp file atomically, then fzf reloads from it:
 
 ```
-ctrl-d  →  execute-silent(sessions.sh --action ctrl-d …)
+ctrl-x  →  execute-silent(sessions.sh --action ctrl-x …)
         +  reload(cat tmpfile)
         +  pos({n})            ← restore cursor to same position
+
+ctrl-d  →  execute(sessions.sh --action ctrl-d …)   ← may show orphaned-dir confirm
+        +  reload(cat tmpfile)
+        +  pos({n})
 ```
 
 `{n}` is fzf's built-in current-line index; `pos({n})` repositions the cursor after the reload so it appears as if the list updated in place.
+
+The list is a 3-field TSV consumed by fzf with `--with-nth 3` (only the display column is shown):
+
+```
+s <TAB> stripped_session_id <TAB> <green>⚡ session_name<reset>   ← running session
+p <TAB> path                <TAB> 📂 display_name                 ← project w/o session
+n <TAB>                     <TAB> ✨ new session                  ← sentinel (always last)
+```
+
+`manage_sessions` runs a `while true` loop so that cancelling the branch picker (`ctrl-bs` inside `pick_branch`) returns to the sessions list rather than closing the popup entirely.
 
 ### Manual sessions
 
@@ -95,6 +109,30 @@ new_score = stored_score × e^(−ln2 × elapsed_seconds / 604800) + 1
 ```
 
 An additional **path-prefix boost** (`shared_prefix_length / 50`) gives higher rank to entries whose path shares more of the current pane's working directory — so worktrees of the same repo float above unrelated projects.
+
+### Invocation modes
+
+| Invocation | Purpose |
+|------------|---------|
+| _(no args)_ | Normal: run `manage_sessions` |
+| `--action <name> <type> <id> <tmpfile>` | Mutation: called by fzf bindings to modify the tmpfile in place, then exit |
+| `--display-name <session_path> <session_name>` | Status bar helper: derives a display name from the session path via `format_session_name`; falls back to the stored name for manually-named sessions whose path doesn't round-trip through dot→underscore conversion |
+
+---
+
+## fetch_reload.sh
+
+Background fetch helper invoked by `pick_branch` (in `common.sh`) when the user presses `ctrl-f` inside the branch picker.
+
+**Arguments:** `repo_path  tmpfile  fzf_port  header_base`
+
+**What it does:**
+
+1. Forks everything to a background subshell immediately (`& disown`) so `execute-silent` returns at once and the picker stays interactive.
+2. Starts a spinner goroutine that sends `change-header(… ⠋ fetching...)` frames to fzf's `--listen` port every 120 ms.
+3. Runs `git fetch --all --quiet` against the repo.
+4. Regenerates the branch list into `tmpfile` via `_gen_branch_picker_entries`.
+5. Kills the spinner, then sends `change-header(…)+reload(cat tmpfile)` to fzf — atomically restoring the header and reloading the list with any newly discovered remote branches.
 
 ---
 
@@ -137,7 +175,7 @@ Scans `~/Projects/` and `$XDG_CONFIG_HOME` with `fd`, looking for `.git` directo
 | `list_worktrees(repo)` | One `path<TAB>branch` line per worktree |
 | `add_worktree(repo, container, branch, new_name)` | Create or locate a worktree; returns its path |
 | `rename_worktree(main_wt, container, wt_path)` | Rename branch, move directory, repair git linkage, re-session |
-| `pick_branch(repo)` | Interactive fzf branch picker with background fetch; returns `new:<name>` or `existing:<branch>` |
+| `pick_branch(repo)` | Interactive fzf branch picker; `ctrl-f` spawns `fetch_reload.sh` for background fetch + spinner; returns `new:<name>` or `existing:<branch>` |
 | `get_default_branch(repo)` | Reads `refs/remotes/origin/HEAD` for the default branch name |
 
 ### Repo layout convention
