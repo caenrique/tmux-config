@@ -326,32 +326,148 @@ add_worktree() {
   echo "$worktree_path"
 }
 
+# Rename a worktree: renames the git branch, moves the directory, repairs the
+# worktree linkage, and opens a fresh tmux session at the new path.
+#
+# Flow:
+#   1. Prompt for a new name (fzf input, pre-filled with current branch).
+#   2. Rename the branch with 'git branch -m' (works in-place at old path).
+#   3. Move the directory with mv.
+#   4. Run 'git worktree repair' to update the stale gitdir pointer.
+#      After mv, .git/worktrees/<name>/gitdir still points to the old path;
+#      repair rewrites it to the new location.
+#   5. Kill the old tmux session (if any) and create a new one.
+rename_worktree() {
+  local repo_path="$1"
+  local container="$2"
+  local wt_path="$3"
+
+  local old_branch
+  old_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+  if [[ -z "$old_branch" ]]; then
+    echo "Cannot rename: worktree is in detached HEAD state" >&2
+    return 1
+  fi
+
+  local rename_output rename_rc rename_key new_name
+  rename_output=$(echo "" | fzf $FZF_INLINE \
+    --print-query --no-select-1 \
+    --query "$old_branch" \
+    --prompt "Rename to: " \
+    --header "enter:rename  ctrl-bs:cancel" \
+    --expect "ctrl-bs")
+  rename_rc=$?
+  [[ $rename_rc -eq 130 ]] && return 1
+  rename_key=$(printf '%s' "$rename_output" | sed -n '2p')
+  [[ "$rename_key" == "ctrl-bs" ]] && return 1
+  new_name=$(sanitize_name "$(printf '%s' "$rename_output" | head -1)")
+  [[ -z "$new_name" || "$new_name" == "$old_branch" ]] && return 1
+
+  local new_dir new_wt_path
+  new_dir=$(branch_to_dir "$new_name")
+  new_wt_path="$container/$new_dir"
+
+  if [[ -e "$new_wt_path" ]]; then
+    echo "Destination already exists: $new_wt_path" >&2
+    return 1
+  fi
+
+  # Rename the branch first while the directory is still at its old location.
+  git -C "$wt_path" branch -m "$old_branch" "$new_name" >&2 || return 1
+
+  # Move the directory; on failure, revert the branch rename.
+  mv "$wt_path" "$new_wt_path" || {
+    git -C "$wt_path" branch -m "$new_name" "$old_branch" >&2 2>/dev/null
+    return 1
+  }
+
+  # Repair the worktree linkage from inside the moved directory.
+  git -C "$new_wt_path" worktree repair >&2
+
+  # Kill the old session (if any).
+  # Switch to the renamed path only when the current pane is inside the
+  # worktree being renamed; otherwise leave the user where they are.
+  local old_session_id pane_root
+  old_session_id=$(get_session_id "$(format_session_name "$wt_path")")
+  [[ -n "$old_session_id" ]] && tmux kill-session -t "$old_session_id" 2>/dev/null
+
+  pane_root=$(git -C "$(tmux display-message -p '#{pane_current_path}')" \
+    rev-parse --show-toplevel 2>/dev/null)
+  [[ "$pane_root" == "$wt_path" ]] && switch_or_create_session "$new_wt_path"
+}
+
+# Emit tab-delimited branch picker entries for fzf: [new] sentinel + all branches.
+_gen_branch_picker_entries() {
+  local repo_path="$1"
+  printf "[new]\t%s new branch\n" "$_ICON_NEW"
+  list_branches "$repo_path" | while IFS= read -r branch; do
+    if [[ "$branch" == origin/* ]]; then
+      printf "%s\t%s %s\n" "$branch" "$_ICON_REMOTE" "$branch"
+    else
+      printf "%s\t%s %s\n" "$branch" "$_ICON_BRANCH" "$branch"
+    fi
+  done
+}
+
+# Return 0 if git fetch should run (FETCH_HEAD missing or >15 min old).
+# Uses --git-common-dir so the check works correctly from inside linked worktrees.
+_fetch_is_stale() {
+  local repo_path="$1"
+  local window=900  # 15 minutes
+  local git_common fetch_head mtime now
+  git_common=$(git -C "$repo_path" rev-parse --git-common-dir 2>/dev/null) || return 0
+  # --git-common-dir returns a relative path for the main worktree; make it absolute.
+  [[ "$git_common" != /* ]] && git_common="$repo_path/$git_common"
+  fetch_head="$git_common/FETCH_HEAD"
+  [[ -f "$fetch_head" ]] || return 0
+  mtime=$(stat -f %m "$fetch_head" 2>/dev/null) || return 0
+  now=$(date +%s)
+  (( now - mtime > window ))
+}
+
 # Interactively pick a branch for a new worktree.
 # Returns "new:<name>" or "existing:<branch>" on stdout with exit 0.
 # Exit 1 = ctrl-bs (go back), exit 2 = Esc (close all).
+#
+# Opens fzf with --listen so a background process can push a reload after
+# git fetch --all completes.  Auto-fetches only when FETCH_HEAD is stale
+# (>15 min); ctrl-f triggers a manual refresh at any time.
 pick_branch() {
   local repo_path="$1"
+  local _port _tmpfile _refresh_script _fetch_pid=""
+  _port=$(( 51200 + RANDOM % 14335 ))
+  _tmpfile=$(mktemp)
+  _refresh_script="$(dirname "${BASH_SOURCE[0]}")/fetch_reload.sh"
+  local _HEADER_BASE="enter:checkout  ctrl-bs:back  ctrl-f:refresh"
+
+  trap 'rm -f "$_tmpfile"; [[ -n "$_fetch_pid" ]] && kill "$_fetch_pid" 2>/dev/null' RETURN
+
+  # Generate initial branch list.
+  _gen_branch_picker_entries "$repo_path" > "$_tmpfile"
+
+  # Auto-fetch in the background if stale.
+  local _initial_header="$_HEADER_BASE"
+  if _fetch_is_stale "$repo_path"; then
+    "$_refresh_script" "$repo_path" "$_tmpfile" "$_port" "$_HEADER_BASE" &
+    _fetch_pid=$!
+    _initial_header="$_HEADER_BASE [syncing...]"
+  fi
 
   while true; do
     local selected rc
     selected=$(
-      {
-        printf "[new]\t%s new branch\n" "$_ICON_NEW"
-        list_branches "$repo_path" | while IFS= read -r branch; do
-          if [[ "$branch" == origin/* ]]; then
-            printf "%s\t%s %s\n" "$branch" "$_ICON_REMOTE" "$branch"
-          else
-            printf "%s\t%s %s\n" "$branch" "$_ICON_BRANCH" "$branch"
-          fi
-        done
-      } | fzf $FZF_POPUP \
+      cat "$_tmpfile" | fzf $FZF_POPUP \
+          --listen "$_port" \
           --with-nth 2 \
           --delimiter $'\t' \
           --prompt "Branch > " \
-          --header "enter:checkout  ctrl-bs:back" \
-          --expect "ctrl-bs"
+          --header "$_initial_header" \
+          --expect "ctrl-bs" \
+          --bind "ctrl-f:change-header($_HEADER_BASE ⟳ fetching...)+execute-silent('$_refresh_script' '$repo_path' '$_tmpfile' '$_port' '$_HEADER_BASE')"
     )
     rc=$?
+    _initial_header="$_HEADER_BASE"  # Reset for any subsequent loop iterations.
+
     [[ $rc -eq 130 ]] && return 2
     [[ -z "$selected" ]] && return 2
 

@@ -92,22 +92,40 @@ build_entries() {
 # Called as: sessions.sh --action <name> <type> <id> <tmpfile>
 # Each is a no-op when type != s (e.g. ctrl-d pressed on a project row).
 
-# ctrl-d: kill session, then remove its worktree if applicable.
+# ctrl-d: kill session + remove its worktree if applicable (session rows);
+#         delete a linked worktree with no session (project rows).
 _action_ctrl_d() {
   local type="$1" id="$2" tmpfile="$3"
-  [[ "$type" != "s" ]] && return
-  local tmux_id="\$$id"
-  local sess_path
-  sess_path=$(tmux display-message -p -t "$tmux_id" '#{session_path}' 2>/dev/null)
-  tmux kill-session -t "$tmux_id" 2>/dev/null
-  local git_dir
-  git_dir=$(git -C "$sess_path" rev-parse --git-dir 2>/dev/null)
-  if [[ "$git_dir" == *"worktrees"* ]]; then
+
+  if [[ "$type" == "s" ]]; then
+    local tmux_id="\$$id"
+    local sess_path
+    sess_path=$(tmux display-message -p -t "$tmux_id" '#{session_path}' 2>/dev/null)
+    tmux kill-session -t "$tmux_id" 2>/dev/null
+    local git_dir
+    git_dir=$(git -C "$sess_path" rev-parse --git-dir 2>/dev/null)
+    if [[ "$git_dir" == *"worktrees"* ]]; then
+      local wt_repo
+      wt_repo=$(git -C "$sess_path" rev-parse --show-toplevel 2>/dev/null)
+      [[ -n "$wt_repo" ]] && git -C "$wt_repo" worktree remove --force "$sess_path" >&2
+    fi
+    grep -v $'^s\t'"$id"$'\t' "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
+
+  elif [[ "$type" == "p" ]]; then
+    local wt_path="$id"
+    local git_dir
+    git_dir=$(git -C "$wt_path" rev-parse --git-dir 2>/dev/null)
+    if [[ "$git_dir" != *"worktrees"* ]]; then
+      tmux display-message -d 2000 "ctrl-d: not a linked worktree"
+      return
+    fi
     local wt_repo
-    wt_repo=$(git -C "$sess_path" rev-parse --show-toplevel 2>/dev/null)
-    [[ -n "$wt_repo" ]] && git -C "$wt_repo" worktree remove --force "$sess_path" >&2
+    wt_repo=$(git -C "$wt_path" rev-parse --show-toplevel 2>/dev/null)
+    [[ -z "$wt_repo" ]] && return
+    git -C "$wt_repo" worktree remove --force "$wt_path" >&2
+    grep -v $'^p\t'"$(printf '%s' "$wt_path" | sed 's|[/\&]|\\&|g')"$'\t' \
+      "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
   fi
-  grep -v $'^s\t'"$id"$'\t' "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
 }
 
 # ctrl-x: kill session only; convert the entry to a project row in place.
@@ -132,33 +150,63 @@ _action_ctrl_x() {
     ' "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
 }
 
-# ctrl-r: rename session via an inline fzf prompt; update display in place.
+# ctrl-r: rename worktree (branch + dir + repair) when on a linked worktree;
+#         rename tmux session only otherwise.
 # Called via fzf execute (not execute-silent) so it has terminal access.
 _action_ctrl_r() {
   local type="$1" id="$2" tmpfile="$3"
-  [[ "$type" != "s" ]] && return
-  local tmux_id="\$$id"
-  local clean_name
-  clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
-  clean_name="${clean_name#${_ICON_SESSION} }"
-  local rename_output rename_rc rename_key new_name
-  rename_output=$(echo "" | fzf $FZF_INLINE \
-    --print-query --no-select-1 \
-    --query "$clean_name" \
-    --prompt "Rename to: " \
-    --header "enter:rename  ctrl-bs:cancel" \
-    --expect "ctrl-bs")
-  rename_rc=$?
-  [[ $rename_rc -eq 130 ]] && return
-  rename_key=$(printf '%s' "$rename_output" | sed -n '2p')
-  [[ "$rename_key" == "ctrl-bs" ]] && return
-  new_name=$(sanitize_name "$(printf '%s' "$rename_output" | head -1)")
-  [[ -z "$new_name" || "$new_name" == "$clean_name" ]] && return
-  tmux rename-session -t "$tmux_id" "$new_name"
-  local new_display="${_GREEN}${_ICON_SESSION} ${new_name}${_RESET}"
-  NEW_DISPLAY="$new_display" awk -F'\t' -v OFS='\t' -v id="$id" \
-      '$1=="s" && $2==id { $3=ENVIRON["NEW_DISPLAY"] } { print }' \
-      "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
+
+  local target_path
+  if [[ "$type" == "s" ]]; then
+    local tmux_id="\$$id"
+    target_path=$(tmux display-message -p -t "$tmux_id" '#{session_path}' 2>/dev/null)
+  elif [[ "$type" == "p" ]]; then
+    target_path="$id"
+  else
+    return
+  fi
+
+  local git_dir
+  git_dir=$(git -C "$target_path" rev-parse --git-dir 2>/dev/null)
+
+  if [[ "$git_dir" == *"worktrees"* ]]; then
+    # Linked worktree: rename branch + move dir + repair linkage.
+    local main_wt container
+    main_wt=$(git -C "$target_path" worktree list --porcelain \
+      | awk '/^worktree /{print $2; exit}')
+    container=$(dirname "$main_wt")
+    rename_worktree "$main_wt" "$container" "$target_path"
+    build_entries > "$tmpfile"
+
+  elif [[ "$type" == "s" ]]; then
+    # Not a worktree: rename tmux session only.
+    local tmux_id="\$$id"
+    local clean_name
+    clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
+    clean_name="${clean_name#${_ICON_SESSION} }"
+    local rename_output rename_rc rename_key new_name
+    rename_output=$(echo "" | fzf $FZF_INLINE \
+      --print-query --no-select-1 \
+      --query "$clean_name" \
+      --prompt "Rename to: " \
+      --header "enter:rename  ctrl-bs:cancel" \
+      --expect "ctrl-bs")
+    rename_rc=$?
+    [[ $rename_rc -eq 130 ]] && return
+    rename_key=$(printf '%s' "$rename_output" | sed -n '2p')
+    [[ "$rename_key" == "ctrl-bs" ]] && return
+    new_name=$(sanitize_name "$(printf '%s' "$rename_output" | head -1)")
+    [[ -z "$new_name" || "$new_name" == "$clean_name" ]] && return
+    tmux rename-session -t "$tmux_id" "$new_name"
+    local new_display="${_GREEN}${_ICON_SESSION} ${new_name}${_RESET}"
+    NEW_DISPLAY="$new_display" awk -F'\t' -v OFS='\t' -v id="$id" \
+        '$1=="s" && $2==id { $3=ENVIRON["NEW_DISPLAY"] } { print }' \
+        "$tmpfile" > "${tmpfile}.new" && mv "${tmpfile}.new" "$tmpfile"
+
+  else
+    # Project row, not a worktree → nothing to rename.
+    tmux display-message -d 2000 "ctrl-r: not a linked worktree"
+  fi
 }
 
 manage_sessions() {

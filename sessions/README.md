@@ -1,14 +1,58 @@
 # sessions/
 
-Scripts powering the tmux session and worktree pickers.
+Scripts powering the tmux session and worktree picker.
 
 | File | Triggered by | Purpose |
 |------|-------------|---------|
 | `common.sh` | (sourced) | Shared utilities, scoring, project discovery, git-worktree helpers |
-| `sessions.sh` | `C-S-s` | Unified session + project picker |
-| `worktree.sh` | `C-S-w` | Git worktree manager for the current project |
+| `sessions.sh` | `C-S-s` | Unified session + project picker with full worktree management |
+| `fetch_reload.sh` | (internal) | Background `git fetch --all` + fzf spinner/reload helper |
 
-> `prompt.sh` was removed — rename prompts use inline fzf (`FZF_INLINE`) via fzf's `execute` binding instead of a separate tmux popup.
+---
+
+## Flow diagram
+
+```mermaid
+flowchart TD
+    Start(["C-S-s"]) --> Picker
+
+    subgraph Picker["fzf popup — sessions.sh"]
+        S["⚡ session rows  (green)"]
+        P["📂 project rows"]
+        N["✨ new session sentinel"]
+    end
+
+    S -->|Enter| Switch["tmux switch-client"]
+    P -->|Enter| Open["create session → switch"]
+    N -->|Enter| NewPrompt["name prompt → create session at ~"]
+
+    S & P -->|ctrl-w| BP
+
+    subgraph BP["pick_branch — common.sh"]
+        BList["branch list\n(local + remote-only)"]
+        BList -->|ctrl-f| Fetch["git fetch --all\n(background · spinner · reload)"]
+        Fetch -.->|reload on complete| BList
+    end
+
+    BP -->|"new:‹name›"| AddNew["add_worktree -b ‹name›\n→ switch"]
+    BP -->|"existing:‹branch›"| AddExisting["add_worktree ‹branch›\n→ switch"]
+
+    S -->|ctrl-d| KillS["kill session"]
+    KillS --> WTC1{"linked\nworktree?"}
+    WTC1 -->|yes| RmS["git worktree remove --force"]
+    WTC1 -->|no| Done1((" "))
+
+    P -->|ctrl-d| WTC2{"linked\nworktree?"}
+    WTC2 -->|yes| RmP["git worktree remove --force\n→ remove row"]
+    WTC2 -->|no| Msg1["⚠ not a linked worktree"]
+
+    S -->|ctrl-x| KillOnly["kill session\n→ row becomes 📂 project"]
+
+    S & P -->|ctrl-r| WTC3{"linked\nworktree?"}
+    WTC3 -->|yes| RenWT["rename_worktree\ngit branch -m · mv · worktree repair"]
+    WTC3 -->|"no (session)"| RenS["tmux rename-session"]
+    WTC3 -->|"no (project)"| Msg2["⚠ not a linked worktree"]
+```
 
 ---
 
@@ -24,10 +68,10 @@ Opens a full-screen fzf popup with a unified, ranked list:
 | Key | On a session row | On a project row | On the sentinel |
 |-----|------------------|------------------|-----------------|
 | `Enter` | Switch to session | Create session and switch | Prompt for name → create session at `~` |
-| `Ctrl-W` | Open branch picker → create worktree | Same | — |
-| `Ctrl-D` | Kill session + delete worktree | — | — |
+| `Ctrl-W` | Open branch picker → create/checkout worktree | Same | — |
+| `Ctrl-D` | Kill session + delete linked worktree | Delete linked worktree; ⚠ message if not a worktree | — |
 | `Ctrl-X` | Kill session; entry moves to project section | — | — |
-| `Ctrl-R` | Rename session in place | — | — |
+| `Ctrl-R` | Rename worktree (branch+dir) if linked; rename session otherwise | Rename linked worktree; ⚠ message if not a worktree | — |
 | `Ctrl-BS` / `Esc` | Close picker | Close picker | Close picker |
 
 `Ctrl-D`, `Ctrl-X` use `execute-silent + reload` — the popup stays open and the list updates in place. `Ctrl-R` uses `execute + reload` (needs terminal access for the inline rename prompt).
@@ -37,7 +81,7 @@ Opens a full-screen fzf popup with a unified, ranked list:
 `manage_sessions` writes the initial list to a temp file once at startup. Each mutating binding calls back into `sessions.sh --action <name>` as a subprocess, which modifies the temp file atomically, then fzf reloads from it:
 
 ```
-ctrl-r  →  execute-silent(sessions.sh --action ctrl-r …)
+ctrl-d  →  execute-silent(sessions.sh --action ctrl-d …)
         +  reload(cat tmpfile)
         +  pos({n})            ← restore cursor to same position
 ```
@@ -67,36 +111,9 @@ An additional **path-prefix boost** (`shared_prefix_length / 50`) gives higher r
 
 ---
 
-## worktree.sh
-
-Opens a full-screen fzf popup listing all git worktrees for the current project. If the active pane is not inside a git repo, a project picker runs first.
-
-### Key bindings
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Switch to (or create) a tmux session for the worktree |
-| `Ctrl-D` | Delete the worktree and kill its tmux session; list updates in place |
-| `Ctrl-R` | Rename: renames the branch, moves the directory, repairs git linkage; list updates in place |
-| `[🔁 switch project]` | Pick a different repo |
-| `[✨ new worktree]` | Open branch picker → add worktree |
-
-### Repo layout convention
-
-```
-~/Projects/my-org/my-repo/
-    main/          ← main worktree (container = my-repo/)
-    feat-login/    ← git worktree add
-    fix-bug/       ← git worktree add
-```
-
-Each subdirectory under the *container* is an independent worktree. Worktree directories are named after their branch with `/` replaced by `-`.
-
----
-
 ## common.sh
 
-Utilities shared by both pickers.
+Utilities shared by all pickers.
 
 ### String helpers
 
@@ -132,5 +149,17 @@ Scans `~/Projects/` and `$XDG_CONFIG_HOME` with `fd`, looking for `.git` directo
 | `list_branches(repo)` | Local branches first, then remote-only (prefixed `origin/`) |
 | `list_worktrees(repo)` | One `path<TAB>branch` line per worktree |
 | `add_worktree(repo, container, branch, new_name)` | Create or locate a worktree; returns its path |
-| `pick_branch(repo)` | Interactive fzf branch picker; returns `new:<name>` or `existing:<branch>` |
+| `rename_worktree(main_wt, container, wt_path)` | Rename branch, move directory, repair git linkage, re-session |
+| `pick_branch(repo)` | Interactive fzf branch picker with background fetch; returns `new:<name>` or `existing:<branch>` |
 | `get_default_branch(repo)` | Reads `refs/remotes/origin/HEAD` for the default branch name |
+
+### Repo layout convention
+
+```
+~/Projects/my-org/my-repo/
+    main/          ← main worktree (container = my-repo/)
+    feat-login/    ← git worktree add
+    fix-bug/       ← git worktree add
+```
+
+Each subdirectory under the *container* is an independent worktree. Worktree directories are named after their branch with `/` replaced by `-`.
