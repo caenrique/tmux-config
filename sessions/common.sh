@@ -19,12 +19,11 @@ FZF_INLINE="--reverse --no-scrollbar --no-info --no-separator --no-border"
 FZF_POPUP="--tmux bottom,100%,100% --scheme=path $FZF_INLINE"
 
 # Emoji icons used across picker lists.
-_ICON_SESSION="⚡"   # running session
-_ICON_PROJECT="📂"   # unopen project
-_ICON_BRANCH="🌱"    # local branch / worktree
-_ICON_REMOTE="📡"    # remote-only branch
-_ICON_NEW="✨"        # new action sentinels
-_ICON_SWITCH="🔁"    # switch project sentinel
+_ICON_SESSION=" "   # running session ⚡
+_ICON_PROJECT=" "   # unopen project 📂
+_ICON_BRANCH=" "    # local branch / worktree 🌱
+_ICON_REMOTE=" "    # remote-only branch 📡
+_ICON_NEW=" "        # new action sentinels
 
 # TSV file storing per-session pick scores for recency ranking.
 SCORE_FILE="$HOME/.local/share/tmux-sessions/scores.tsv"

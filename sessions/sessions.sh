@@ -271,7 +271,7 @@ manage_sessions() {
           --delimiter $'\t' \
           --prompt "Sessions > " \
           --expect "ctrl-w,ctrl-bs" \
-          --header "enter:open  ctrl-w:worktree  ctrl-d:wt+kill  ctrl-x:kill  ctrl-r:rename  ?:preview  ctrl-bs:back" \
+          --header "enter:open ctrl-bs:back ?:preview ctrl-x:delete-session ctrl-r:rename ctrl-w:worktree ctrl-d:remove-worktree" \
           --preview "[ '{1}' = s ] \
                      && tmux capture-pane -e -p -t '\$'{2} 2>/dev/null \
                      || ls '{2}' 2>/dev/null" \
