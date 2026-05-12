@@ -187,8 +187,8 @@ sort_by_score() {
     }
     {
       score = ($1 in scores) ? scores[$1] : 0
-      # Path-prefix boost: add cpl/50 where cpl is the common prefix length
-      # between field 3 and boost_path.  50-char match ≈ +1.0 to score.
+      # Path-prefix boost: add cpl/300 where cpl is the common prefix length
+      # between field 3 and boost_path.  A full ~60-char path match ≈ +0.2 to score.
       if (boost_path != "" && NF >= 3 && $3 != "") {
         n = length(boost_path) < length($3) ? length(boost_path) : length($3)
         cpl = 0
@@ -196,7 +196,7 @@ sort_by_score() {
           if (substr($3, i, 1) == substr(boost_path, i, 1)) cpl++
           else break
         }
-        score += cpl / 50.0
+        score += cpl / 300.0
       }
       # Zero-pad to 20 chars so lexicographic and numeric sort agree.
       printf "%020.6f\t%s\n", score, $0
@@ -319,7 +319,11 @@ add_worktree() {
     fi
     dir_name=$(branch_to_dir "$local_branch")
     worktree_path="$container/$dir_name"
-    git -C "$repo_path" worktree add "$worktree_path" "$branch" >&2 || return 1
+    if [[ "$branch" == origin/* ]]; then
+      git -C "$repo_path" worktree add -b "$local_branch" "$worktree_path" "$branch" >&2 || return 1
+    else
+      git -C "$repo_path" worktree add "$worktree_path" "$branch" >&2 || return 1
+    fi
   fi
 
   echo "$worktree_path"

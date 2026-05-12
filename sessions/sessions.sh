@@ -28,6 +28,7 @@ list_projects() {
 # Catppuccin Mocha green — used to highlight running session rows.
 # \033[38;2;R;G;Bm sets a 24-bit foreground colour; \033[0m resets it.
 _GREEN=$'\033[38;2;166;227;161m'
+_YELLOW=$'\033[38;2;249;226;175m'
 _RESET=$'\033[0m'
 
 # Emit the unified 3-field TSV list consumed by manage_sessions.
@@ -49,7 +50,20 @@ build_entries() {
   local sessions_blob
   sessions_blob=$'\n'$(tmux ls -F "#{session_name}" 2>/dev/null | sed 's/\./_/g')$'\n'
 
-  # Pin the previous session at the very top (if it exists and differs from current).
+  # Pin the current session first (yellow, labelled "(current)").
+  if [[ -n "$current_session" ]]; then
+    local curr_id
+    curr_id=$(get_session_id "$current_session")
+    if [[ -n "$curr_id" ]]; then
+      local curr_path curr_display
+      curr_path=$(tmux display-message -p -t "$curr_id" '#{session_path}' 2>/dev/null)
+      curr_display=$(format_session_name "$curr_path")
+      [[ "${curr_display//./_}" != "$current_session" ]] && curr_display="$current_session"
+      printf "s\t%s\t%s%s (current) %s%s\n" "${curr_id#\$}" "$_YELLOW" "$_ICON_SESSION" "$curr_display" "$_RESET"
+    fi
+  fi
+
+  # Pin the previous session second (green, labelled "(previous)").
   if [[ -n "$prev_session" && "$prev_session" != "$current_session" ]]; then
     local prev_id
     prev_id=$(get_session_id "$prev_session")
@@ -60,7 +74,7 @@ build_entries() {
       # Only use the path-derived name when it maps back to the stored name
       # (dots→underscores). For manually-named sessions it won't match, so fall back.
       [[ "${prev_display//./_}" != "$prev_session" ]] && prev_display="$prev_session"
-      printf "s\t%s\t%s%s %s%s\n" "${prev_id#\$}" "$_GREEN" "$_ICON_SESSION" "$prev_display" "$_RESET"
+      printf "s\t%s\t%s%s (previous) %s%s\n" "${prev_id#\$}" "$_GREEN" "$_ICON_SESSION" "$prev_display" "$_RESET"
     fi
   fi
 
@@ -73,6 +87,7 @@ build_entries() {
     | sed 's/^\$//' \
     | while IFS=$'\t' read -r raw_id name sess_path; do
         [[ "$name" == "$prev_session" ]] && continue
+        [[ "$name" == "$current_session" ]] && continue
         derived=$(format_session_name "$sess_path")
         [[ "${derived//./_}" != "$name" ]] && derived="$name"
         printf "%s\t%s\t%s\n" "$derived" "$raw_id" "$sess_path"
@@ -178,6 +193,8 @@ _action_ctrl_x() {
   local clean_name
   clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
   clean_name="${clean_name#${_ICON_SESSION} }"
+  clean_name="${clean_name#(current) }"
+  clean_name="${clean_name#(previous) }"
   tmux kill-session -t "$tmux_id" 2>/dev/null
   # Remove the session row from its current position and insert it as a project
   # row just before the new-session sentinel so it lands in the projects section.
@@ -224,6 +241,8 @@ _action_ctrl_r() {
     local clean_name
     clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
     clean_name="${clean_name#${_ICON_SESSION} }"
+    clean_name="${clean_name#(current) }"
+    clean_name="${clean_name#(previous) }"
     local rename_output rename_rc rename_key new_name
     rename_output=$(echo "" | fzf $FZF_INLINE \
       --print-query --no-select-1 \
