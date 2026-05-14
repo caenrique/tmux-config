@@ -33,7 +33,7 @@ _RESET=$'\033[0m'
 
 # Emit the unified 3-field TSV list consumed by manage_sessions.
 # Format: type<TAB>key<TAB>display
-#   s <TAB> stripped_id <TAB> <green>session_name<reset>    ← running session
+#   s <TAB> stripped_id <TAB> <green>session_name [(current)|(previous)]<reset>  ← running session
 #   p <TAB> path        <TAB> display_name                  ← project w/o session
 #   n <TAB>             <TAB> display_name                  ← new-session sentinel
 #
@@ -59,7 +59,7 @@ build_entries() {
       curr_path=$(tmux display-message -p -t "$curr_id" '#{session_path}' 2>/dev/null)
       curr_display=$(format_session_name "$curr_path")
       [[ "${curr_display//./_}" != "$current_session" ]] && curr_display="$current_session"
-      printf "s\t%s\t%s%s (current) %s%s\n" "${curr_id#\$}" "$_YELLOW" "$_ICON_SESSION" "$curr_display" "$_RESET"
+      printf "s\t%s\t%s%s %s (current)%s\n" "${curr_id#\$}" "$_YELLOW" "$_ICON_SESSION" "$curr_display" "$_RESET"
     fi
   fi
 
@@ -74,7 +74,7 @@ build_entries() {
       # Only use the path-derived name when it maps back to the stored name
       # (dots→underscores). For manually-named sessions it won't match, so fall back.
       [[ "${prev_display//./_}" != "$prev_session" ]] && prev_display="$prev_session"
-      printf "s\t%s\t%s%s (previous) %s%s\n" "${prev_id#\$}" "$_GREEN" "$_ICON_SESSION" "$prev_display" "$_RESET"
+      printf "s\t%s\t%s%s %s (previous)%s\n" "${prev_id#\$}" "$_GREEN" "$_ICON_SESSION" "$prev_display" "$_RESET"
     fi
   fi
 
@@ -193,8 +193,8 @@ _action_ctrl_x() {
   local clean_name
   clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
   clean_name="${clean_name#${_ICON_SESSION} }"
-  clean_name="${clean_name#(current) }"
-  clean_name="${clean_name#(previous) }"
+  clean_name="${clean_name% (current)}"
+  clean_name="${clean_name% (previous)}"
   tmux kill-session -t "$tmux_id" 2>/dev/null
   # Remove the session row from its current position and insert it as a project
   # row just before the new-session sentinel so it lands in the projects section.
@@ -241,8 +241,8 @@ _action_ctrl_r() {
     local clean_name
     clean_name=$(strip_ansi "$(grep $'^s\t'"$id"$'\t' "$tmpfile" | cut -f3)")
     clean_name="${clean_name#${_ICON_SESSION} }"
-    clean_name="${clean_name#(current) }"
-    clean_name="${clean_name#(previous) }"
+    clean_name="${clean_name% (current)}"
+    clean_name="${clean_name% (previous)}"
     local rename_output rename_rc rename_key new_name
     rename_output=$(echo "" | fzf $FZF_INLINE \
       --print-query --no-select-1 \
@@ -287,6 +287,7 @@ manage_sessions() {
       | fzf $FZF_POPUP \
           --ansi \
           --with-nth 3 \
+          --tiebreak=index \
           --delimiter $'\t' \
           --prompt "Sessions > " \
           --expect "ctrl-w,ctrl-bs" \
